@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import time
 from typing import Optional
 from dotenv import load_dotenv
 from google import genai
@@ -8,18 +9,104 @@ from google.genai import types
 
 load_dotenv()
 
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+PRIMARY_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-_gemini_client = None
+# Daftar model cadangan otomatis jika model utama habis kuota (429) atau sibuk (503)
+FALLBACK_MODELS = [
+    PRIMARY_MODEL,
+    "gemini-3.8-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+]
 
-def get_gemini_client() -> genai.Client:
-    global _gemini_client
-    if _gemini_client is None:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY belum diset di file .env!")
-        _gemini_client = genai.Client(api_key=api_key)
-    return _gemini_client
+
+def get_api_keys_pool() -> list[str]:
+    """
+    Mengumpulkan seluruh API Key yang tersedia dari Environment / Streamlit Secrets.
+    Mendukung:
+    1. GEMINI_API_KEY (bisa berisi 1 key, atau banyak key dipisah koma: "key1,key2,key3")
+    2. GEMINI_API_KEY_2, GEMINI_API_KEY_3, dst.
+    """
+    keys = []
+
+    # Cek langsung dari streamlit secrets jika berjalan di Streamlit Cloud
+    try:
+        import streamlit as st
+        for k_name in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"]:
+            if k_name in st.secrets and st.secrets[k_name]:
+                raw_val = str(st.secrets[k_name])
+                for part in raw_val.split(","):
+                    clean_k = part.strip()
+                    if clean_k and clean_k not in keys:
+                        keys.append(clean_k)
+    except Exception:
+        pass
+
+    # Cek dari os.environ (.env lokal)
+    for k_name in ["GEMINI_API_KEY", "GEMINI_API_KEYS", "GEMINI_API_KEY_1", "GEMINI_API_KEY_2", "GEMINI_API_KEY_3", "GEMINI_API_KEY_4", "GEMINI_API_KEY_5"]:
+        raw_val = os.getenv(k_name, "")
+        if raw_val:
+            for part in raw_val.split(","):
+                clean_k = part.strip()
+                if clean_k and clean_k not in keys:
+                    keys.append(clean_k)
+
+    if not keys:
+        raise ValueError("GEMINI_API_KEY belum diset di file .env atau Streamlit Secrets!")
+
+    return keys
+
+
+def generate_with_smart_failover(contents, config: types.GenerateContentConfig):
+    """
+    Mesin Eksekusi Pintar:
+    - Otomatis merotasi API Key jika terkena limit kuota 429 (RESOURCE_EXHAUSTED).
+    - Otomatis melakukan retry & fallback ke model cadangan jika terkena 503 (UNAVAILABLE) atau 429.
+    """
+    api_keys = get_api_keys_pool()
+    models_to_try = list(dict.fromkeys(FALLBACK_MODELS))
+    last_error = None
+
+    for model_name in models_to_try:
+        for key_idx, api_key in enumerate(api_keys):
+            client = genai.Client(api_key=api_key)
+            # Coba maksimal 2 kali per kombinasi (Key + Model) untuk antisipasi 503 sesaat
+            for attempt in range(2):
+                try:
+                    response = client.models.generate_content(
+                        model=model_name,
+                        contents=contents,
+                        config=config,
+                    )
+                    return response
+                except Exception as e:
+                    last_error = e
+                    err_str = str(e).upper()
+
+                    # 1. Jika model tidak ditemukan (404), langsung lompat ke model berikutnya
+                    if "404" in err_str or "NOT_FOUND" in err_str:
+                        break
+
+                    # 2. Jika kuota key ini habis (429), langsung pindah ke API Key berikutnya!
+                    if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "QUOTA" in err_str:
+                        break
+
+                    # 3. Jika server Google sedang padat (503), tunggu sebentar lalu coba lagi
+                    if "503" in err_str or "UNAVAILABLE" in err_str or "OVERLOADED" in err_str:
+                        if attempt == 0:
+                            time.sleep(1.5)
+                            continue
+                        break
+
+                    # Error lain (misal koneksi terputus sesaat)
+                    break
+
+    raise RuntimeError(
+        f"Seluruh API Key ({len(api_keys)} Key) dan model cadangan sedang mencapai batas kuota/sibuk. "
+        f"Tambahkan API Key cadangan baru di Streamlit Secrets. Detail terakhir: {last_error}"
+    )
+
 
 def clean_latex_artifacts(text: str) -> str:
     r"""
@@ -28,15 +115,12 @@ def clean_latex_artifacts(text: str) -> str:
     """
     if not text:
         return ""
-    # Ubah \mathbf{...} menjadi **...**
     text = re.sub(r"\\mathbf\{([^}]*)\}", r"**\1**", text)
-    # Ubah \text{...} atau \mathrm{...} menjadi teks biasa
     text = re.sub(r"\\(?:text|mathrm)\{([^}]*)\}", r"\1", text)
-    # Hapus pembungkus math inline $...$ jika di dalamnya hanya angka/operasi sederhana
     text = re.sub(r"\$([^$\r\n]+)\$", r"\1", text)
-    # Hapus sisa backslash LaTeX umum
     text = text.replace(r"\times", "x").replace(r"\approx", "~").replace(r"\cdot", "·")
     return text.strip()
+
 
 BASE_SYSTEM_PROMPT = r"""
 Kamu adalah "Bro PT", Personal Trainer, Ahli Fisiologi Olahraga, & Konsultan Nutrisi Pribadi tingkat tinggi untuk sahabatmu, Bro Derry (Pria, 31 tahun, tinggi 180 cm).
@@ -57,6 +141,7 @@ ATURAN EMAS INTERAKSI & KONSISTENSI DATA (WAJIB DIPATUHI):
    - Kejar target protein harian untuk menjaga massa otot (Lean Body Mass) sembari memangkas Visceral Fat dari 15.0 menuju <=10.0.
    - Jaga ketat kuota lemak harian (waspadai minyak gorengan, santan kental, saus berminyak).
 """
+
 
 def build_realtime_context_block(daily_summary: dict) -> str:
     profile = daily_summary.get("profile", {})
@@ -122,6 +207,7 @@ def build_realtime_context_block(daily_summary: dict) -> str:
 ==============================================================
 """
 
+
 SCAN_JSON_SCHEMA = r"""
 Kembalikan HANYA JSON valid (tanpa markdown block ```json) dengan struktur persis berikut:
 {
@@ -169,6 +255,7 @@ ATURAN PENTING MEMBEDAKAN SCREENSHOT GARMIN:
 3. Isi `null` pada objek data yang tidak relevan dengan `scan_type` terpilih.
 """
 
+
 def _parse_json_response(raw_text: str) -> dict:
     cleaned = raw_text.strip()
     if cleaned.startswith("```"):
@@ -179,13 +266,13 @@ def _parse_json_response(raw_text: str) -> dict:
         data["coach_evaluation"] = clean_latex_artifacts(data["coach_evaluation"])
     return data
 
+
 def analyze_image_and_extract(
     image_bytes: bytes,
     mime_type: str,
     user_note: str,
     daily_summary: dict
 ) -> dict:
-    client = get_gemini_client()
     context_block = build_realtime_context_block(daily_summary)
 
     prompt = f"""
@@ -199,19 +286,16 @@ Tugasmu:
 {SCAN_JSON_SCHEMA}
 """
     image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=[image_part, prompt],
-        config=types.GenerateContentConfig(
-            system_instruction=BASE_SYSTEM_PROMPT,
-            temperature=0.25,
-            response_mime_type="application/json"
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=BASE_SYSTEM_PROMPT,
+        temperature=0.25,
+        response_mime_type="application/json"
     )
+    response = generate_with_smart_failover(contents=[image_part, prompt], config=config)
     return _parse_json_response(response.text)
 
+
 def analyze_text_log_and_extract(user_text: str, daily_summary: dict) -> dict:
-    client = get_gemini_client()
     context_block = build_realtime_context_block(daily_summary)
 
     prompt = f"""
@@ -224,16 +308,14 @@ Tugasmu:
 2. Ekstrak estimasi makronutrisi atau metrik olahraganya secara objektif dan sains, lalu berikan `coach_evaluation` taktis.
 {SCAN_JSON_SCHEMA}
 """
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=BASE_SYSTEM_PROMPT,
-            temperature=0.25,
-            response_mime_type="application/json"
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=BASE_SYSTEM_PROMPT,
+        temperature=0.25,
+        response_mime_type="application/json"
     )
+    response = generate_with_smart_failover(contents=prompt, config=config)
     return _parse_json_response(response.text)
+
 
 def chat_with_bro_pt(
     user_message: str,
@@ -242,11 +324,6 @@ def chat_with_bro_pt(
     image_bytes: Optional[bytes] = None,
     mime_type: Optional[str] = "image/jpeg"
 ) -> str:
-    """
-    Menjawab konsultasi di Tab 3 dengan dukungan gambar (multimodal)
-    dan 100% terkunci pada angka Single Source of Truth dari Python.
-    """
-    client = get_gemini_client()
     context_block = build_realtime_context_block(daily_summary)
 
     nl = "\n"
@@ -276,12 +353,9 @@ INSTRUKSI JAWABAN:
         image_part = types.Part.from_bytes(data=image_bytes, mime_type=mime_type)
         contents.insert(0, image_part)
 
-    response = client.models.generate_content(
-        model=MODEL_NAME,
-        contents=contents,
-        config=types.GenerateContentConfig(
-            system_instruction=BASE_SYSTEM_PROMPT,
-            temperature=0.35,
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=BASE_SYSTEM_PROMPT,
+        temperature=0.35,
     )
+    response = generate_with_smart_failover(contents=contents, config=config)
     return clean_latex_artifacts(response.text)
