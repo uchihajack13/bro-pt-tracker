@@ -6,3 +6,6 @@ google-genai
 pydantic
 python-multipart
 tzdata
+streamlit
+plotly
+pandas
