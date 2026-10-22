@@ -9,11 +9,10 @@ from google.genai import types
 
 load_dotenv()
 
-# MEMBALIK URUTAN MODEL: Utamakan model alternatif agar tidak menabrak limit harian gemini-3.8-flash
+# Menggunakan model stabil yang kuota hariannya masih bersih
 FALLBACK_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
-    "gemini-3.8-flash",
     "gemini-2.5-flash-lite",
 ]
 
@@ -65,7 +64,6 @@ def generate_with_smart_failover(contents, config: types.GenerateContentConfig):
                     if "404" in err_str or "NOT_FOUND" in err_str:
                         break
                     if "429" in err_str or "RESOURCE_EXHAUSTED" in err_str or "QUOTA" in err_str:
-                        # Langsung pindah ke API key atau model berikutnya
                         break
                     if "503" in err_str or "UNAVAILABLE" in err_str:
                         if attempt == 0:
